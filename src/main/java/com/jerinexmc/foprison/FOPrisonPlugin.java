@@ -386,6 +386,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
                     if (sharedCubeIndex >= totalCubeBlocks) {
                         buildingSpheres = true;
+
                         caster.sendMessage(
                                 ChatColor.GRAY
                                         + "The ground begins rising..."
@@ -494,7 +495,6 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
             }
         }
 
-        // Take the closest surface blocks first, then dig deeper.
         candidates.sort(
                 Comparator.comparingInt(
                         (SourceBlock source) -> baseY - source.y
@@ -529,10 +529,13 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    // COMPATIBLE SOURCE-BLOCK CHECK
     private boolean isUsableSource(Block block) {
         Material type = block.getType();
 
-        if (type.isAir() || !type.isSolid() || type.isLiquid()) {
+        if (type.isAir() || !type.isSolid()
+                || type == Material.WATER
+                || type == Material.LAVA) {
             return false;
         }
 
@@ -578,7 +581,6 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                 destination.z
         );
 
-        // Save the original ground block before removing it.
         originalBlocks.putIfAbsent(
                 sourceKey,
                 sourceBlock.getBlockData().getAsString()
@@ -586,7 +588,6 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
         generatedBlocks.add(sourceKey);
 
-        // Save the original destination before the display arrives.
         Block destinationBlock = world.getBlockAt(
                 destination.x,
                 destination.y,
@@ -667,7 +668,6 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                     (double) moving.elapsed / moving.duration
             );
 
-            // Smooth upward arc as the block travels.
             double x = lerp(
                     moving.start.getX(),
                     moving.end.getX(),
@@ -755,10 +755,8 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         LivingEntity target = prison.target;
 
         if (target.isValid() && !target.isDead()) {
-            Attribute maxHealthAttribute = Attribute.MAX_HEALTH;
-
-            double maxHealth = target.getAttribute(maxHealthAttribute) != null
-                    ? target.getAttribute(maxHealthAttribute).getValue()
+            double maxHealth = target.getAttribute(Attribute.MAX_HEALTH) != null
+                    ? target.getAttribute(Attribute.MAX_HEALTH).getValue()
                     : 20.0;
 
             target.setHealth(Math.max(
