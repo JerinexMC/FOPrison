@@ -1,0 +1,6 @@
+name: FOPrison
+version: 1.0.0
+main: com.jerinexmc.foprison.FOPrisonPlugin
+api-version: '1.21.11'
+author: JerinexMC
+description: FO fire shockwave and permanent Shibaku Tensei-style prisons.
