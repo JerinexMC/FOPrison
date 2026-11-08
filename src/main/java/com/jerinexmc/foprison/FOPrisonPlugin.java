@@ -2,7 +2,11 @@
 package com.jerinexmc.foprison;
 
 import org.bukkit.*;
+import org.bukkit.attribute.Attribute;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockState;
+import org.bukkit.block.TileState;
+import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.*;
 import org.bukkit.event.*;
 import org.bukkit.event.block.BlockBreakEvent;
@@ -26,17 +30,22 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
     private final Map<String, String> originalBlocks = new LinkedHashMap<>();
     private final Set<String> generatedBlocks = new LinkedHashSet<>();
-
-    // Blocks protected only while their prison is being built.
     private final Map<String, Integer> protectionCounts = new HashMap<>();
+
+    private final List<MovingBlock> movingBlocks = new ArrayList<>();
 
     private boolean building;
     private UUID activeCaster;
 
     private static final int RANGE = 20;
     private static final double LIFT_HEIGHT = 15.0;
+
     private static final long BUILD_INTERVAL = 1L;
     private static final int BLOCKS_PER_CYCLE = 3;
+
+    private static final int SOURCE_RADIUS = 3;
+    private static final int SOURCE_DEPTH = 12;
+    private static final int BLOCK_TRAVEL_TICKS = 8;
 
     @Override
     public void onEnable() {
@@ -47,10 +56,12 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
+        removeMovingDisplays();
         savePrisonData();
 
         for (UUID id : new ArrayList<>(frozenToCaster.keySet())) {
             Entity entity = Bukkit.getEntity(id);
+
             if (entity instanceof LivingEntity living) {
                 unfreeze(living);
             }
@@ -296,20 +307,34 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         }.runTaskTimer(this, 0L, 2L);
     }
 
-    // SYNCHRONIZED CONSTRUCTION FOR EVERY ENTITY
+    // BUILD ALL BOXES, THEN ALL EARTHEN SPHERES
     private void beginPrisonConstruction(
             Player caster,
             List<LivingEntity> targets
     ) {
         List<PrisonBuild> prisons = new ArrayList<>();
+        Set<String> reservedSources = new HashSet<>();
 
         for (LivingEntity target : targets) {
             if (!target.isValid() || target.isDead()) continue;
 
+            Location originalLocation = frozenLocations.get(
+                    target.getUniqueId()
+            );
+
+            if (originalLocation == null) continue;
+
             Location center = target.getLocation().getBlock().getLocation();
             center.add(0, -1, 0);
 
-            prisons.add(new PrisonBuild(target, center));
+            PrisonBuild prison = new PrisonBuild(
+                    target,
+                    center,
+                    originalLocation.clone()
+            );
+
+            prepareSourceBlocks(prison, reservedSources);
+            prisons.add(prison);
         }
 
         if (prisons.isEmpty()) {
@@ -330,8 +355,9 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                     return;
                 }
 
-                // PHASE 1:
-                // Every entity gets the same obsidian blocks each cycle.
+                updateMovingBlocks();
+
+                // PHASE 1: OBSIDIAN BOXES
                 if (!buildingSpheres) {
                     int totalCubeBlocks =
                             prisons.get(0).cubePositions.size();
@@ -358,18 +384,27 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                         sharedCubeIndex++;
                     }
 
-                    // All boxes finish before any sphere starts.
                     if (sharedCubeIndex >= totalCubeBlocks) {
                         buildingSpheres = true;
+                        caster.sendMessage(
+                                ChatColor.GRAY
+                                        + "The ground begins rising..."
+                        );
                     }
 
+                    savePrisonData();
                     return;
                 }
 
-                // PHASE 2:
-                // Every entity gets the same sphere blocks each cycle.
-                int totalSphereBlocks =
-                        prisons.get(0).spherePositions.size();
+                // PHASE 2: PULL REAL BLOCKS FROM UNDER EACH TARGET
+                int totalSphereBlocks = 0;
+
+                for (PrisonBuild prison : prisons) {
+                    totalSphereBlocks = Math.max(
+                            totalSphereBlocks,
+                            prison.sourceBlocks.size()
+                    );
+                }
 
                 for (int batch = 0;
                      batch < BLOCKS_PER_CYCLE
@@ -377,62 +412,353 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                      batch++) {
 
                     for (PrisonBuild prison : prisons) {
-                        BlockPos pos =
+                        if (sharedSphereIndex >= prison.sourceBlocks.size()) {
+                            continue;
+                        }
+
+                        SourceBlock source =
+                                prison.sourceBlocks.get(sharedSphereIndex);
+
+                        BlockPos destination =
                                 prison.spherePositions.get(sharedSphereIndex);
 
-                        if (pos.shell) {
-                            setGenerated(
-                                    prison,
-                                    pos.x,
-                                    pos.y,
-                                    pos.z,
-                                    prison.center.getWorld(),
-                                    chooseEarthMaterial()
-                            );
-                        }
+                        startMovingBlock(prison, source, destination);
                     }
 
                     sharedSphereIndex++;
                 }
 
-                // Complete every prison on the same final cycle.
-                if (sharedSphereIndex >= totalSphereBlocks) {
+                if (sharedSphereIndex >= totalSphereBlocks
+                        && movingBlocks.isEmpty()) {
+
                     for (PrisonBuild prison : prisons) {
                         completePrison(prison);
                     }
 
+                    savePrisonData();
                     finishBuilding();
                     cancel();
+                    return;
                 }
+
+                savePrisonData();
             }
         }.runTaskTimer(this, 0L, BUILD_INTERVAL);
     }
 
-    // RELEASE PROTECTION WHEN THIS ENTITY'S SPHERE IS FINISHED
+    // FIND REAL BLOCKS DIRECTLY UNDER THE TARGET
+    private void prepareSourceBlocks(
+            PrisonBuild prison,
+            Set<String> reservedSources
+    ) {
+        Location origin = prison.originalLocation;
+        World world = origin.getWorld();
+
+        List<SourceBlock> candidates = new ArrayList<>();
+
+        int baseX = origin.getBlockX();
+        int baseY = origin.getBlockY();
+        int baseZ = origin.getBlockZ();
+
+        for (int depth = 1; depth <= SOURCE_DEPTH; depth++) {
+            for (int x = -SOURCE_RADIUS; x <= SOURCE_RADIUS; x++) {
+                for (int z = -SOURCE_RADIUS; z <= SOURCE_RADIUS; z++) {
+
+                    Block block = world.getBlockAt(
+                            baseX + x,
+                            baseY - depth,
+                            baseZ + z
+                    );
+
+                    String sourceKey = key(
+                            world,
+                            block.getX(),
+                            block.getY(),
+                            block.getZ()
+                    );
+
+                    if (reservedSources.contains(sourceKey)
+                            || generatedBlocks.contains(sourceKey)) {
+                        continue;
+                    }
+
+                    if (!isUsableSource(block)) continue;
+
+                    candidates.add(new SourceBlock(
+                            block.getX(),
+                            block.getY(),
+                            block.getZ(),
+                            block.getBlockData().clone()
+                    ));
+                }
+            }
+        }
+
+        // Take the closest surface blocks first, then dig deeper.
+        candidates.sort(
+                Comparator.comparingInt(
+                        (SourceBlock source) -> baseY - source.y
+                ).thenComparingDouble(source ->
+                        Math.pow(source.x - baseX, 2)
+                                + Math.pow(source.z - baseZ, 2)
+                )
+        );
+
+        int needed = prison.spherePositions.size();
+        int amount = Math.min(needed, candidates.size());
+
+        for (int i = 0; i < amount; i++) {
+            SourceBlock source = candidates.get(i);
+
+            String sourceKey = key(
+                    world,
+                    source.x,
+                    source.y,
+                    source.z
+            );
+
+            reservedSources.add(sourceKey);
+            prison.sourceBlocks.add(source);
+        }
+
+        if (amount < needed) {
+            getLogger().warning(
+                    "Only found " + amount
+                            + " usable ground blocks for a prison."
+            );
+        }
+    }
+
+    private boolean isUsableSource(Block block) {
+        Material type = block.getType();
+
+        if (type.isAir() || !type.isSolid() || type.isLiquid()) {
+            return false;
+        }
+
+        if (type == Material.BEDROCK
+                || type == Material.BARRIER
+                || type == Material.END_PORTAL_FRAME
+                || type == Material.END_PORTAL
+                || type == Material.NETHER_PORTAL
+                || type == Material.STRUCTURE_VOID) {
+            return false;
+        }
+
+        BlockState state = block.getState();
+
+        return !(state instanceof TileState);
+    }
+
+    // REMOVE THE SOURCE BLOCK AND ANIMATE IT TOWARD ITS DESTINATION
+    private void startMovingBlock(
+            PrisonBuild prison,
+            SourceBlock source,
+            BlockPos destination
+    ) {
+        World world = prison.center.getWorld();
+
+        Block sourceBlock = world.getBlockAt(
+                source.x,
+                source.y,
+                source.z
+        );
+
+        String sourceKey = key(
+                world,
+                source.x,
+                source.y,
+                source.z
+        );
+
+        String destinationKey = key(
+                world,
+                destination.x,
+                destination.y,
+                destination.z
+        );
+
+        // Save the original ground block before removing it.
+        originalBlocks.putIfAbsent(
+                sourceKey,
+                sourceBlock.getBlockData().getAsString()
+        );
+
+        generatedBlocks.add(sourceKey);
+
+        // Save the original destination before the display arrives.
+        Block destinationBlock = world.getBlockAt(
+                destination.x,
+                destination.y,
+                destination.z
+        );
+
+        originalBlocks.putIfAbsent(
+                destinationKey,
+                destinationBlock.getBlockData().getAsString()
+        );
+
+        generatedBlocks.add(destinationKey);
+
+        if (prison.blocks.add(destinationKey)) {
+            protectionCounts.merge(destinationKey, 1, Integer::sum);
+        }
+
+        sourceBlock.setType(Material.AIR, false);
+
+        Location start = new Location(
+                world,
+                source.x,
+                source.y,
+                source.z
+        );
+
+        Location end = new Location(
+                world,
+                destination.x,
+                destination.y,
+                destination.z
+        );
+
+        BlockDisplay display = world.spawn(
+                start,
+                BlockDisplay.class
+        );
+
+        display.setBlock(source.data);
+        display.setGravity(false);
+        display.setInvulnerable(true);
+        display.setPersistent(false);
+        display.setInterpolationDuration(2);
+        display.setTeleportDuration(2);
+
+        movingBlocks.add(new MovingBlock(
+                display,
+                start,
+                end,
+                source.data,
+                BLOCK_TRAVEL_TICKS
+        ));
+
+        world.playSound(
+                start,
+                Sound.BLOCK_ROOTED_DIRT_BREAK,
+                0.35f,
+                0.8f
+        );
+    }
+
+    // MOVE ALL BLOCK DISPLAYS EACH TICK
+    private void updateMovingBlocks() {
+        Iterator<MovingBlock> iterator = movingBlocks.iterator();
+
+        while (iterator.hasNext()) {
+            MovingBlock moving = iterator.next();
+
+            if (!moving.display.isValid()) {
+                iterator.remove();
+                continue;
+            }
+
+            moving.elapsed++;
+
+            double progress = Math.min(
+                    1.0,
+                    (double) moving.elapsed / moving.duration
+            );
+
+            // Smooth upward arc as the block travels.
+            double x = lerp(
+                    moving.start.getX(),
+                    moving.end.getX(),
+                    progress
+            );
+
+            double y = lerp(
+                    moving.start.getY(),
+                    moving.end.getY(),
+                    progress
+            );
+
+            double z = lerp(
+                    moving.start.getZ(),
+                    moving.end.getZ(),
+                    progress
+            );
+
+            double arc = Math.sin(progress * Math.PI) * 2.0;
+            y += arc;
+
+            Location current = new Location(
+                    moving.start.getWorld(),
+                    x,
+                    y,
+                    z
+            );
+
+            moving.display.teleport(current);
+
+            if (moving.elapsed >= moving.duration) {
+                Block finalBlock = moving.end.getBlock();
+
+                finalBlock.setBlockData(
+                        moving.data,
+                        false
+                );
+
+                moving.display.remove();
+                iterator.remove();
+
+                moving.end.getWorld().spawnParticle(
+                        Particle.BLOCK,
+                        moving.end.clone().add(0.5, 0.5, 0.5),
+                        5,
+                        0.2,
+                        0.2,
+                        0.2,
+                        moving.data
+                );
+            }
+        }
+    }
+
+    private double lerp(double start, double end, double progress) {
+        return start + (end - start) * progress;
+    }
+
+    private void removeMovingDisplays() {
+        for (MovingBlock moving : new ArrayList<>(movingBlocks)) {
+            if (moving.display.isValid()) {
+                moving.display.remove();
+            }
+        }
+
+        movingBlocks.clear();
+    }
+
+    // RELEASE PROTECTION WHEN THE PRISON IS FINISHED
     private void completePrison(PrisonBuild prison) {
         if (prison.finished) return;
 
         prison.finished = true;
 
-        for (String key : prison.blocks) {
-            Integer count = protectionCounts.get(key);
+        for (String blockKey : prison.blocks) {
+            Integer count = protectionCounts.get(blockKey);
 
             if (count == null || count <= 1) {
-                protectionCounts.remove(key);
+                protectionCounts.remove(blockKey);
             } else {
-                protectionCounts.put(key, count - 1);
+                protectionCounts.put(blockKey, count - 1);
             }
         }
 
         LivingEntity target = prison.target;
 
         if (target.isValid() && !target.isDead()) {
-            double maxHealth = target.getAttribute(
-                    org.bukkit.attribute.Attribute.MAX_HEALTH
-            ) != null
-                    ? target.getAttribute(
-                            org.bukkit.attribute.Attribute.MAX_HEALTH
-                    ).getValue()
+            Attribute maxHealthAttribute = Attribute.MAX_HEALTH;
+
+            double maxHealth = target.getAttribute(maxHealthAttribute) != null
+                    ? target.getAttribute(maxHealthAttribute).getValue()
                     : 20.0;
 
             target.setHealth(Math.max(
@@ -467,8 +793,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                         result.add(new BlockPos(
                                 center.getBlockX() + x,
                                 center.getBlockY() + y,
-                                center.getBlockZ() + z,
-                                true
+                                center.getBlockZ() + z
                         ));
                     }
                 }
@@ -478,7 +803,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         return result;
     }
 
-    private List<BlockPos> createSphere(Location center, int radius) {
+    private List<BlockPos> createSphereShell(Location center, int radius) {
         List<BlockPos> result = new ArrayList<>();
 
         for (int y = -radius; y <= radius; y++) {
@@ -486,45 +811,22 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                 for (int z = -radius; z <= radius; z++) {
                     double distance = x * x + y * y + z * z;
 
-                    if (distance <= radius * radius + 0.5) {
-                        boolean shell = distance >=
-                                (radius - 1.15) * (radius - 1.15);
+                    if (distance <= radius * radius + 0.5
+                            && distance >= (radius - 1.15)
+                            * (radius - 1.15)) {
 
                         result.add(new BlockPos(
                                 center.getBlockX() + x,
                                 center.getBlockY() + y,
-                                center.getBlockZ() + z,
-                                shell
+                                center.getBlockZ() + z
                         ));
                     }
                 }
             }
         }
 
-        result.sort(Comparator.comparingInt(p -> p.y));
+        result.sort(Comparator.comparingInt(pos -> pos.y));
         return result;
-    }
-
-    // NO ORES
-    private Material chooseEarthMaterial() {
-        Material[] materials = {
-                Material.DIRT,
-                Material.ROOTED_DIRT,
-                Material.COARSE_DIRT,
-                Material.PODZOL,
-                Material.MUD,
-                Material.STONE,
-                Material.GRANITE,
-                Material.ANDESITE,
-                Material.DIORITE,
-                Material.TUFF,
-                Material.COBBLESTONE,
-                Material.MOSS_BLOCK,
-                Material.DEEPSLATE,
-                Material.COBBLED_DEEPSLATE
-        };
-
-        return materials[new Random().nextInt(materials.length)];
     }
 
     private void setGenerated(
@@ -536,22 +838,20 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
             Material material
     ) {
         Block block = world.getBlockAt(x, y, z);
-        String key = key(world, x, y, z);
+        String blockKey = key(world, x, y, z);
 
         originalBlocks.putIfAbsent(
-                key,
+                blockKey,
                 block.getBlockData().getAsString()
         );
 
-        generatedBlocks.add(key);
+        generatedBlocks.add(blockKey);
 
-        if (prison.blocks.add(key)) {
-            protectionCounts.merge(key, 1, Integer::sum);
+        if (prison.blocks.add(blockKey)) {
+            protectionCounts.merge(blockKey, 1, Integer::sum);
         }
 
         block.setType(material, false);
-
-        savePrisonData();
     }
 
     private void unfreeze(LivingEntity entity) {
@@ -597,6 +897,8 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
         Bukkit.getScheduler().cancelTasks(this);
 
+        removeMovingDisplays();
+
         for (UUID id : new ArrayList<>(frozenToCaster.keySet())) {
             Entity entity = Bukkit.getEntity(id);
 
@@ -608,8 +910,8 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         List<String> keys = new ArrayList<>(generatedBlocks);
         Collections.reverse(keys);
 
-        for (String key : keys) {
-            restoreBlock(key);
+        for (String blockKey : keys) {
+            restoreBlock(blockKey);
         }
 
         generatedBlocks.clear();
@@ -634,8 +936,8 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         );
     }
 
-    private void restoreBlock(String key) {
-        String[] parts = key.split("\\|", 4);
+    private void restoreBlock(String blockKey) {
+        String[] parts = blockKey.split("\\|", 4);
 
         if (parts.length != 4) return;
 
@@ -647,7 +949,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
             int y = Integer.parseInt(parts[2]);
             int z = Integer.parseInt(parts[3]);
 
-            String data = originalBlocks.get(key);
+            String data = originalBlocks.get(blockKey);
 
             if (data != null) {
                 world.getBlockAt(x, y, z).setBlockData(
@@ -657,7 +959,8 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
             }
         } catch (Exception ex) {
             getLogger().warning(
-                    "Could not restore block " + key + ": " + ex.getMessage()
+                    "Could not restore block " + blockKey
+                            + ": " + ex.getMessage()
             );
         }
     }
@@ -679,12 +982,12 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         originalBlocks.clear();
 
         if (getConfig().isConfigurationSection("originals")) {
-            for (String key :
+            for (String blockKey :
                     getConfig().getConfigurationSection("originals").getKeys(false)) {
 
                 originalBlocks.put(
-                        key,
-                        getConfig().getString("originals." + key)
+                        blockKey,
+                        getConfig().getString("originals." + blockKey)
                 );
             }
         }
@@ -781,20 +1084,67 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
     private class PrisonBuild {
         final LivingEntity target;
         final Location center;
+        final Location originalLocation;
+
         final List<BlockPos> cubePositions;
         final List<BlockPos> spherePositions;
+
+        final List<SourceBlock> sourceBlocks = new ArrayList<>();
         final Set<String> blocks = new LinkedHashSet<>();
 
         boolean finished = false;
 
-        PrisonBuild(LivingEntity target, Location center) {
+        PrisonBuild(
+                LivingEntity target,
+                Location center,
+                Location originalLocation
+        ) {
             this.target = target;
             this.center = center;
+            this.originalLocation = originalLocation;
 
             this.cubePositions = createCube(center);
-            this.spherePositions = createSphere(center, 3);
+            this.spherePositions = createSphereShell(center, 3);
         }
     }
 
-    private record BlockPos(int x, int y, int z, boolean shell) {}
+    private static class SourceBlock {
+        final int x;
+        final int y;
+        final int z;
+        final BlockData data;
+
+        SourceBlock(int x, int y, int z, BlockData data) {
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.data = data;
+        }
+    }
+
+    private static class MovingBlock {
+        final BlockDisplay display;
+        final Location start;
+        final Location end;
+        final BlockData data;
+        final int duration;
+
+        int elapsed = 0;
+
+        MovingBlock(
+                BlockDisplay display,
+                Location start,
+                Location end,
+                BlockData data,
+                int duration
+        ) {
+            this.display = display;
+            this.start = start;
+            this.end = end;
+            this.data = data;
+            this.duration = duration;
+        }
+    }
+
+    private record BlockPos(int x, int y, int z) {}
 }
