@@ -18,6 +18,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 
 import java.util.*;
@@ -38,14 +39,22 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
     private UUID activeCaster;
 
     private static final int RANGE = 20;
-    private static final double LIFT_HEIGHT = 15.0;
 
     private static final long BUILD_INTERVAL = 1L;
     private static final int BLOCKS_PER_CYCLE = 3;
+    private static final int BLOCK_TRAVEL_TICKS = 12;
 
-    private static final int SOURCE_RADIUS = 3;
-    private static final int SOURCE_DEPTH = 12;
-    private static final int BLOCK_TRAVEL_TICKS = 8;
+    private static final int FO_LIFT_HEIGHT = 15;
+    private static final int SHIBAKU_LIFT_HEIGHT = 50;
+
+    private static final int FO_SPHERE_RADIUS = 3;
+    private static final int SHIBAKU_SPHERE_RADIUS = 12;
+
+    private static final int FO_SOURCE_RADIUS = 10;
+    private static final int SHIBAKU_SOURCE_RADIUS = 30;
+
+    private static final int FO_SOURCE_DEPTH = 8;
+    private static final int SHIBAKU_SOURCE_DEPTH = 8;
 
     @Override
     public void onEnable() {
@@ -68,13 +77,21 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    // OP-ONLY CHAT ACTIVATION
+    // CHAT COMMANDS
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onChat(AsyncPlayerChatEvent event) {
-        String message = event.getMessage().trim();
+        String message = event.getMessage().trim()
+                .replaceAll("\\s+", " ")
+                .toUpperCase(Locale.ROOT);
 
-        if (!message.equalsIgnoreCase("FO")
-                && !message.equalsIgnoreCase("FO STOP")) {
+        boolean isFO = message.equals("FO");
+        boolean isStop = message.equals("FO STOP");
+
+        boolean isShibaku = message.equals("SHIBAKU")
+                || message.equals("SHIBAKU TENSEI")
+                || message.equals("CHIBAKU TENSEI");
+
+        if (!isFO && !isStop && !isShibaku) {
             return;
         }
 
@@ -86,21 +103,28 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
             if (!player.isOnline()) return;
 
             if (!player.isOp()) {
-                player.sendMessage(ChatColor.RED + "Only operators can use FO.");
+                player.sendMessage(
+                        ChatColor.RED + "Only operators can use these abilities."
+                );
                 return;
             }
 
-            if (message.equalsIgnoreCase("FO")) {
-                activate(player);
-            } else {
+            if (isFO) {
+                activateFO(player);
+            } else if (isStop) {
                 releaseAll(player);
+            } else {
+                activateShibaku(player);
             }
         });
     }
 
-    private void activate(Player caster) {
+    // NORMAL FO: TARGET EVERY LIVING ENTITY WITHIN 20 BLOCKS
+    private void activateFO(Player caster) {
         if (building) {
-            caster.sendMessage(ChatColor.RED + "An FO event is already building.");
+            caster.sendMessage(
+                    ChatColor.RED + "An FO event is already active."
+            );
             return;
         }
 
@@ -117,15 +141,81 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         }
 
         if (targets.isEmpty()) {
-            caster.sendMessage(ChatColor.YELLOW
-                    + "No living entities were found within 20 blocks.");
+            caster.sendMessage(
+                    ChatColor.YELLOW
+                            + "No living entities were found within 20 blocks."
+            );
             return;
         }
 
+        startAbility(
+                caster,
+                targets,
+                FO_LIFT_HEIGHT,
+                FO_SPHERE_RADIUS,
+                FO_SOURCE_RADIUS,
+                FO_SOURCE_DEPTH,
+                "FO"
+        );
+    }
+
+    // SHIBAKU: ONLY TARGET THE ENTITY THE PLAYER IS AIMING AT
+    private void activateShibaku(Player caster) {
+        if (building) {
+            caster.sendMessage(
+                    ChatColor.RED + "An FO event is already active."
+            );
+            return;
+        }
+
+        RayTraceResult result = caster.getWorld().rayTraceEntities(
+                caster.getEyeLocation(),
+                caster.getEyeLocation().getDirection(),
+                100,
+                0.5,
+                entity -> entity instanceof LivingEntity
+                        && !(entity instanceof ArmorStand)
+                        && !entity.getUniqueId().equals(caster.getUniqueId())
+        );
+
+        if (result == null
+                || !(result.getHitEntity() instanceof LivingEntity target)) {
+            caster.sendMessage(
+                    ChatColor.RED
+                            + "Aim directly at a living entity first."
+            );
+            return;
+        }
+
+        caster.sendMessage(
+                ChatColor.DARK_PURPLE + "SHIBAKU TENSEI!"
+        );
+
+        startAbility(
+                caster,
+                Collections.singletonList(target),
+                SHIBAKU_LIFT_HEIGHT,
+                SHIBAKU_SPHERE_RADIUS,
+                SHIBAKU_SOURCE_RADIUS,
+                SHIBAKU_SOURCE_DEPTH,
+                "SHIBAKU TENSEI"
+        );
+    }
+
+    // SHARED ABILITY STARTUP
+    private void startAbility(
+            Player caster,
+            List<LivingEntity> targets,
+            int liftHeight,
+            int sphereRadius,
+            int sourceRadius,
+            int sourceDepth,
+            String abilityName
+    ) {
         building = true;
         activeCaster = caster.getUniqueId();
 
-        caster.sendMessage(ChatColor.GOLD + "FO!");
+        caster.sendMessage(ChatColor.GOLD + abilityName + "!");
 
         caster.getWorld().playSound(
                 caster.getLocation(),
@@ -159,17 +249,10 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
                 ticks++;
 
-                for (UUID id : new ArrayList<>(frozenToCaster.keySet())) {
-                    if (!caster.getUniqueId().equals(frozenToCaster.get(id))) {
-                        continue;
-                    }
+                for (LivingEntity target : targets) {
+                    if (!target.isValid() || target.isDead()) continue;
 
-                    Entity entity = Bukkit.getEntity(id);
-
-                    if (!(entity instanceof LivingEntity living)
-                            || !living.isValid()) {
-                        continue;
-                    }
+                    UUID id = target.getUniqueId();
 
                     Location origin = frozenLocations.get(id);
                     Float[] rotation = frozenRotation.get(id);
@@ -180,33 +263,50 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
                     Location lift = origin.clone().add(
                             0,
-                            LIFT_HEIGHT * progress,
+                            liftHeight * progress,
                             0
                     );
 
                     lift.setYaw(rotation[0]);
                     lift.setPitch(rotation[1]);
 
-                    living.teleport(lift);
-                    living.setVelocity(new Vector(0, 0, 0));
-                    living.setFallDistance(0);
+                    target.teleport(lift);
+                    target.setVelocity(new Vector(0, 0, 0));
+                    target.setFallDistance(0);
 
-                    if (ticks % 10 == 0) {
-                        living.getWorld().spawnParticle(
+                    if (ticks % 8 == 0) {
+                        target.getWorld().spawnParticle(
                                 Particle.SMOKE,
                                 lift.clone().add(0, 0.8, 0),
-                                8,
+                                10,
                                 0.35,
                                 0.5,
                                 0.35,
                                 0.01
+                        );
+
+                        target.getWorld().spawnParticle(
+                                Particle.PORTAL,
+                                lift.clone(),
+                                8,
+                                0.5,
+                                0.8,
+                                0.5,
+                                0.1
                         );
                     }
                 }
 
                 if (ticks >= 100) {
                     cancel();
-                    beginPrisonConstruction(caster, targets);
+
+                    beginPrisonConstruction(
+                            caster,
+                            targets,
+                            sphereRadius,
+                            sourceRadius,
+                            sourceDepth
+                    );
                 }
             }
         }.runTaskTimer(this, 0L, 1L);
@@ -234,7 +334,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
         target.addPotionEffect(new PotionEffect(
                 PotionEffectType.DARKNESS,
-                120,
+                140,
                 0,
                 false,
                 false,
@@ -243,10 +343,10 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
         if (target instanceof Player player) {
             player.sendTitle(
-                    ChatColor.DARK_GRAY + "FO",
+                    ChatColor.DARK_PURPLE + "SHIBAKU",
                     ChatColor.GRAY + "You are being lifted...",
                     0,
-                    35,
+                    40,
                     5
             );
         }
@@ -307,13 +407,15 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         }.runTaskTimer(this, 0L, 2L);
     }
 
-    // BUILD ALL BOXES, THEN ALL EARTHEN SPHERES
+    // PREPARE ALL PRISONS
     private void beginPrisonConstruction(
             Player caster,
-            List<LivingEntity> targets
+            List<LivingEntity> targets,
+            int sphereRadius,
+            int sourceRadius,
+            int sourceDepth
     ) {
         List<PrisonBuild> prisons = new ArrayList<>();
-        Set<String> reservedSources = new HashSet<>();
 
         for (LivingEntity target : targets) {
             if (!target.isValid() || target.isDead()) continue;
@@ -327,14 +429,12 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
             Location center = target.getLocation().getBlock().getLocation();
             center.add(0, -1, 0);
 
-            PrisonBuild prison = new PrisonBuild(
+            prisons.add(new PrisonBuild(
                     target,
                     center,
-                    originalLocation.clone()
-            );
-
-            prepareSourceBlocks(prison, reservedSources);
-            prisons.add(prison);
+                    originalLocation.clone(),
+                    sphereRadius
+            ));
         }
 
         if (prisons.isEmpty()) {
@@ -342,6 +442,47 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
             return;
         }
 
+        // Reserve every destination so source blocks cannot be taken
+        // from a position that another prison needs to build.
+        Set<String> allDestinations = new HashSet<>();
+
+        for (PrisonBuild prison : prisons) {
+            for (BlockPos pos : prison.cubePositions) {
+                allDestinations.add(key(
+                        prison.center.getWorld(),
+                        pos.x,
+                        pos.y,
+                        pos.z
+                ));
+            }
+
+            for (BlockPos pos : prison.spherePositions) {
+                allDestinations.add(key(
+                        prison.center.getWorld(),
+                        pos.x,
+                        pos.y,
+                        pos.z
+                ));
+            }
+        }
+
+        Set<String> reservedSources = new HashSet<>();
+
+        for (PrisonBuild prison : prisons) {
+            prepareSourceBlocks(
+                    prison,
+                    sourceRadius,
+                    sourceDepth,
+                    reservedSources,
+                    allDestinations
+            );
+        }
+
+        caster.sendMessage(
+                ChatColor.GRAY + "The obsidian prison is forming..."
+        );
+
+        // ALL BOXES FIRST, THEN ALL SPHERES
         new BukkitRunnable() {
             int sharedCubeIndex = 0;
             int sharedSphereIndex = 0;
@@ -350,14 +491,14 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
             @Override
             public void run() {
-                if (!building || !caster.isOnline()) {
+                if (!building) {
                     cancel();
                     return;
                 }
 
                 updateMovingBlocks();
 
-                // PHASE 1: OBSIDIAN BOXES
+                // PHASE 1: BUILD OBSIDIAN BOXES
                 if (!buildingSpheres) {
                     int totalCubeBlocks =
                             prisons.get(0).cubePositions.size();
@@ -388,8 +529,8 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                         buildingSpheres = true;
 
                         caster.sendMessage(
-                                ChatColor.GRAY
-                                        + "The ground begins rising..."
+                                ChatColor.DARK_PURPLE
+                                        + "The ground is being pulled upward..."
                         );
                     }
 
@@ -397,7 +538,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                     return;
                 }
 
-                // PHASE 2: PULL REAL BLOCKS FROM UNDER EACH TARGET
+                // PHASE 2: PULL SCATTERED BLOCKS INTO THE SPHERE
                 int totalSphereBlocks = 0;
 
                 for (PrisonBuild prison : prisons) {
@@ -447,27 +588,43 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         }.runTaskTimer(this, 0L, BUILD_INTERVAL);
     }
 
-    // FIND REAL BLOCKS DIRECTLY UNDER THE TARGET
+    // FIND RANDOM, SCATTERED BLOCKS AROUND THE TARGET'S ORIGINAL GROUND
     private void prepareSourceBlocks(
             PrisonBuild prison,
-            Set<String> reservedSources
+            int radius,
+            int depth,
+            Set<String> reservedSources,
+            Set<String> allDestinations
     ) {
         Location origin = prison.originalLocation;
         World world = origin.getWorld();
-
-        List<SourceBlock> candidates = new ArrayList<>();
 
         int baseX = origin.getBlockX();
         int baseY = origin.getBlockY();
         int baseZ = origin.getBlockZ();
 
-        for (int depth = 1; depth <= SOURCE_DEPTH; depth++) {
-            for (int x = -SOURCE_RADIUS; x <= SOURCE_RADIUS; x++) {
-                for (int z = -SOURCE_RADIUS; z <= SOURCE_RADIUS; z++) {
+        List<SourceBlock> candidates = new ArrayList<>();
 
+        // Search a circular area, not a square.
+        // The inner radius keeps the blocks spread farther away.
+        int innerRadius = Math.max(3, radius / 4);
+
+        for (int x = -radius; x <= radius; x++) {
+            for (int z = -radius; z <= radius; z++) {
+                double horizontalDistance = Math.sqrt(x * x + z * z);
+
+                if (horizontalDistance > radius
+                        || horizontalDistance < innerRadius) {
+                    continue;
+                }
+
+                // Randomize the vertical depth for each column.
+                int randomDepth = 1 + new Random().nextInt(depth);
+
+                for (int d = 1; d <= randomDepth; d++) {
                     Block block = world.getBlockAt(
                             baseX + x,
-                            baseY - depth,
+                            baseY - d,
                             baseZ + z
                     );
 
@@ -479,7 +636,8 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                     );
 
                     if (reservedSources.contains(sourceKey)
-                            || generatedBlocks.contains(sourceKey)) {
+                            || generatedBlocks.contains(sourceKey)
+                            || allDestinations.contains(sourceKey)) {
                         continue;
                     }
 
@@ -495,14 +653,9 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
             }
         }
 
-        candidates.sort(
-                Comparator.comparingInt(
-                        (SourceBlock source) -> baseY - source.y
-                ).thenComparingDouble(source ->
-                        Math.pow(source.x - baseX, 2)
-                                + Math.pow(source.z - baseZ, 2)
-                )
-        );
+        // Shuffle the source positions so they are not collected
+        // in a neat pattern or from one coordinated section.
+        Collections.shuffle(candidates);
 
         int needed = prison.spherePositions.size();
         int amount = Math.min(needed, candidates.size());
@@ -523,13 +676,16 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
         if (amount < needed) {
             getLogger().warning(
-                    "Only found " + amount
-                            + " usable ground blocks for a prison."
+                    "Only found " + amount + " of " + needed
+                            + " source blocks for a sphere."
             );
         }
+
+        getLogger().info(
+                "Prepared " + amount + " scattered source blocks."
+        );
     }
 
-    // COMPATIBLE SOURCE-BLOCK CHECK
     private boolean isUsableSource(Block block) {
         Material type = block.getType();
 
@@ -553,7 +709,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         return !(state instanceof TileState);
     }
 
-    // REMOVE THE SOURCE BLOCK AND ANIMATE IT TOWARD ITS DESTINATION
+    // TAKE A REAL BLOCK FROM THE GROUND AND ANIMATE IT
     private void startMovingBlock(
             PrisonBuild prison,
             SourceBlock source,
@@ -581,6 +737,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                 destination.z
         );
 
+        // Save the original source block for FO STOP.
         originalBlocks.putIfAbsent(
                 sourceKey,
                 sourceBlock.getBlockData().getAsString()
@@ -588,6 +745,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
         generatedBlocks.add(sourceKey);
 
+        // Save the original destination block.
         Block destinationBlock = world.getBlockAt(
                 destination.x,
                 destination.y,
@@ -605,6 +763,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
             protectionCounts.merge(destinationKey, 1, Integer::sum);
         }
 
+        // Remove the actual block from its original position.
         sourceBlock.setType(Material.AIR, false);
 
         Location start = new Location(
@@ -644,12 +803,12 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         world.playSound(
                 start,
                 Sound.BLOCK_ROOTED_DIRT_BREAK,
-                0.35f,
+                0.25f,
                 0.8f
         );
     }
 
-    // MOVE ALL BLOCK DISPLAYS EACH TICK
+    // UPDATE EVERY MOVING BLOCK
     private void updateMovingBlocks() {
         Iterator<MovingBlock> iterator = movingBlocks.iterator();
 
@@ -686,6 +845,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                     progress
             );
 
+            // Give each block a rising arc.
             double arc = Math.sin(progress * Math.PI) * 2.0;
             y += arc;
 
@@ -712,10 +872,11 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
                 moving.end.getWorld().spawnParticle(
                         Particle.BLOCK,
                         moving.end.clone().add(0.5, 0.5, 0.5),
-                        5,
-                        0.2,
-                        0.2,
-                        0.2,
+                        4,
+                        0.15,
+                        0.15,
+                        0.15,
+                        0.0,
                         moving.data
                 );
             }
@@ -736,7 +897,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         movingBlocks.clear();
     }
 
-    // RELEASE PROTECTION WHEN THE PRISON IS FINISHED
+    // COMPLETE THE PRISON
     private void completePrison(PrisonBuild prison) {
         if (prison.finished) return;
 
@@ -768,16 +929,17 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
 
             if (target instanceof Player player) {
                 player.sendTitle(
-                        ChatColor.DARK_GRAY + "SEALED",
+                        ChatColor.DARK_PURPLE + "SEALED",
                         ChatColor.GRAY + "Break your way out!",
                         5,
-                        35,
+                        45,
                         10
                 );
             }
         }
     }
 
+    // OBSIDIAN BOX
     private List<BlockPos> createCube(Location center) {
         List<BlockPos> result = new ArrayList<>();
 
@@ -801,17 +963,23 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         return result;
     }
 
-    private List<BlockPos> createSphereShell(Location center, int radius) {
+    // SPHERE SHELL
+    private List<BlockPos> createSphereShell(
+            Location center,
+            int radius
+    ) {
         List<BlockPos> result = new ArrayList<>();
+
+        double outerRadius = radius * radius + 0.5;
+        double innerRadius = (radius - 1.15) * (radius - 1.15);
 
         for (int y = -radius; y <= radius; y++) {
             for (int x = -radius; x <= radius; x++) {
                 for (int z = -radius; z <= radius; z++) {
                     double distance = x * x + y * y + z * z;
 
-                    if (distance <= radius * radius + 0.5
-                            && distance >= (radius - 1.15)
-                            * (radius - 1.15)) {
+                    if (distance <= outerRadius
+                            && distance >= innerRadius) {
 
                         result.add(new BlockPos(
                                 center.getBlockX() + x,
@@ -823,7 +991,9 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
             }
         }
 
+        // Build from the bottom upward.
         result.sort(Comparator.comparingInt(pos -> pos.y));
+
         return result;
     }
 
@@ -883,7 +1053,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         savePrisonData();
     }
 
-    // FO STOP
+    // FO STOP: CANCEL AND RESTORE EVERYTHING
     private void releaseAll(Player operator) {
         if (generatedBlocks.isEmpty() && !building) {
             operator.sendMessage(
@@ -940,6 +1110,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         if (parts.length != 4) return;
 
         World world = Bukkit.getWorld(parts[0]);
+
         if (world == null) return;
 
         try {
@@ -1090,19 +1261,23 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         final List<SourceBlock> sourceBlocks = new ArrayList<>();
         final Set<String> blocks = new LinkedHashSet<>();
 
-        boolean finished = false;
+        boolean finished;
 
         PrisonBuild(
                 LivingEntity target,
                 Location center,
-                Location originalLocation
+                Location originalLocation,
+                int sphereRadius
         ) {
             this.target = target;
             this.center = center;
             this.originalLocation = originalLocation;
 
             this.cubePositions = createCube(center);
-            this.spherePositions = createSphereShell(center, 3);
+            this.spherePositions = createSphereShell(
+                    center,
+                    sphereRadius
+            );
         }
     }
 
@@ -1112,7 +1287,12 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         final int z;
         final BlockData data;
 
-        SourceBlock(int x, int y, int z, BlockData data) {
+        SourceBlock(
+                int x,
+                int y,
+                int z,
+                BlockData data
+        ) {
             this.x = x;
             this.y = y;
             this.z = z;
@@ -1127,7 +1307,7 @@ public final class FOPrisonPlugin extends JavaPlugin implements Listener {
         final BlockData data;
         final int duration;
 
-        int elapsed = 0;
+        int elapsed;
 
         MovingBlock(
                 BlockDisplay display,
